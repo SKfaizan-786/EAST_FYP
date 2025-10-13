@@ -1,0 +1,1129 @@
+EAST-Implement Technical Implementation Plan
+
+Executive Summary
+
+This plan provides a detailed roadmap for implementing EAST (Efficient and Accurate Scene Text) detector using modern PyTorch practices. The implementation follows research-grade standards with comprehensive evaluation, modular architecture, and production-ready deployment capabilities.
+
+Phase 1: Core Architecture Implementation (Week 1-2)
+
+1.1 Project Structure Setup
+```
+east_implement/
+├── east/
+│   ├── __init__.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── backbone.py          # ResNet/VGG backbone implementations
+│   │   ├── feature_fusion.py    # Progressive upsampling with skip connections
+│   │   ├── heads.py             # Score and geometry prediction heads
+│   │   └── east_model.py        # Main EAST model class
+│   ├── datasets/
+│   │   ├── __init__.py
+│   │   ├── icdar.py             # ICDAR dataset loader
+│   │   ├── transforms.py        # Data augmentation pipeline
+│   │   └── utils.py             # Dataset utilities
+│   ├── losses/
+│   │   ├── __init__.py
+│   │   ├── east_loss.py         # Combined loss implementation
+│   │   └── geometry_loss.py     # Geometry-specific losses
+│   ├── utils/
+│   │   ├── __init__.py
+│   │   ├── postprocess.py       # NMS and coordinate restoration
+│   │   ├── visualization.py     # Detection visualization tools
+│   │   └── metrics.py           # Evaluation metrics
+│   └── evaluation/
+│       ├── __init__.py
+│       ├── icdar_eval.py        # ICDAR evaluation integration
+│       └── benchmark.py         # Performance benchmarking
+├── configs/
+│   ├── east_resnet18.yaml       # ResNet-18 configuration
+│   ├── east_resnet50.yaml       # ResNet-50 configuration
+│   └── training_config.yaml     # Training hyperparameters
+├── tools/
+│   ├── train.py                 # Training script
+│   ├── eval.py                  # Evaluation script
+│   ├── infer.py                 # Inference script
+│   └── convert_onnx.py          # ONNX conversion utility
+├── notebooks/
+│   ├── 01_architecture_overview.ipynb
+│   ├── 02_training_tutorial.ipynb
+│   └── 03_evaluation_demo.ipynb
+├── tests/
+│   ├── test_models.py
+│   ├── test_losses.py
+│   └── test_datasets.py
+├── docker/
+│   ├── Dockerfile.train         # Training container
+│   └── Dockerfile.serve         # Serving container
+├── requirements.txt
+├── setup.py
+└── README.md
+```
+
+1.2 Backbone Implementation (models/backbone.py)
+```python
+import torch
+import torch.nn as nn
+import torchvision.models as models
+from typing import Dict, List
+
+class ResNetBackbone(nn.Module):
+    """ResNet backbone for feature extraction"""
+    
+    def __init__(self, arch='resnet18', pretrained=True):
+        super().__init__()
+        self.arch = arch
+        
+        if arch == 'resnet18':
+            resnet = models.resnet18(pretrained=pretrained)
+            self.feature_channels = [64, 128, 256, 512]
+        elif arch == 'resnet50':
+            resnet = models.resnet50(pretrained=pretrained)
+            self.feature_channels = [256, 512, 1024, 2048]
+        else:
+            raise ValueError(f"Unsupported architecture: {arch}")
+        
+        # Extract feature extraction layers
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+        
+        self.layer1 = resnet.layer1  # conv2_x
+        self.layer2 = resnet.layer2  # conv3_x
+        self.layer3 = resnet.layer3  # conv4_x
+        self.layer4 = resnet.layer4  # conv5_x
+        
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Extract multi-scale features"""
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        
+        f1 = self.layer1(x)  # 1/4 resolution
+        f2 = self.layer2(f1) # 1/8 resolution
+        f3 = self.layer3(f2) # 1/16 resolution
+        f4 = self.layer4(f3) # 1/32 resolution
+        
+        return {
+            'conv2': f1,
+            'conv3': f2,
+            'conv4': f3,
+            'conv5': f4
+        }
+```
+
+1.3 Feature Fusion Implementation (models/feature_fusion.py)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict
+
+class FeatureFusionNetwork(nn.Module):
+    """Progressive feature fusion with skip connections"""
+    
+    def __init__(self, feature_channels: List[int], output_channels: int = 128):
+        super().__init__()
+        self.output_channels = output_channels
+        
+        # Lateral connections for feature pyramid
+        self.lateral_conv5 = nn.Conv2d(feature_channels[3], output_channels, 1)
+        self.lateral_conv4 = nn.Conv2d(feature_channels[2], output_channels, 1)
+        self.lateral_conv3 = nn.Conv2d(feature_channels[1], output_channels, 1)
+        self.lateral_conv2 = nn.Conv2d(feature_channels[0], output_channels, 1)
+        
+        # Fusion convolutions
+        self.fusion_conv5 = nn.Conv2d(output_channels, output_channels, 3, padding=1)
+        self.fusion_conv4 = nn.Conv2d(output_channels, output_channels, 3, padding=1)
+        self.fusion_conv3 = nn.Conv2d(output_channels, output_channels, 3, padding=1)
+        self.fusion_conv2 = nn.Conv2d(output_channels, output_channels, 3, padding=1)
+        
+        # Final fusion
+        self.final_conv = nn.Conv2d(output_channels * 4, output_channels, 1)
+        
+    def forward(self, features: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Progressive upsampling with feature fusion"""
+        f2, f3, f4, f5 = features['conv2'], features['conv3'], features['conv4'], features['conv5']
+        
+        # Top-down pathway
+        p5 = self.lateral_conv5(f5)
+        p5 = self.fusion_conv5(p5)
+        
+        p4 = self.lateral_conv4(f4) + F.interpolate(p5, scale_factor=2, mode='bilinear', align_corners=False)
+        p4 = self.fusion_conv4(p4)
+        
+        p3 = self.lateral_conv3(f3) + F.interpolate(p4, scale_factor=2, mode='bilinear', align_corners=False)
+        p3 = self.fusion_conv3(p3)
+        
+        p2 = self.lateral_conv2(f2) + F.interpolate(p3, scale_factor=2, mode='bilinear', align_corners=False)
+        p2 = self.fusion_conv2(p2)
+        
+        # Upsample all to same resolution and concatenate
+        h, w = p2.shape[2], p2.shape[3]
+        p3_up = F.interpolate(p3, size=(h, w), mode='bilinear', align_corners=False)
+        p4_up = F.interpolate(p4, size=(h, w), mode='bilinear', align_corners=False)
+        p5_up = F.interpolate(p5, size=(h, w), mode='bilinear', align_corners=False)
+        
+        # Final fusion
+        fused = torch.cat([p2, p3_up, p4_up, p5_up], dim=1)
+        output = self.final_conv(fused)
+        
+        return output
+```
+
+1.4 Main EAST Model (models/east_model.py)
+```python
+import torch
+import torch.nn as nn
+from typing import Tuple, Dict
+
+from .backbone import ResNetBackbone
+from .feature_fusion import FeatureFusionNetwork
+
+class EAST(nn.Module):
+    """EAST: Efficient and Accurate Scene Text detector"""
+    
+    def __init__(self, 
+                 backbone: str = 'resnet18',
+                 pretrained: bool = True,
+                 feature_dim: int = 128,
+                 geometry_type: str = 'QUAD'):
+        super().__init__()
+        
+        self.backbone_net = ResNetBackbone(backbone, pretrained)
+        self.feature_fusion = FeatureFusionNetwork(
+            self.backbone_net.feature_channels, 
+            feature_dim
+        )
+        
+        # Prediction heads
+        self.score_head = nn.Sequential(
+            nn.Conv2d(feature_dim, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, 1),
+            nn.Sigmoid()
+        )
+        
+        # Geometry head - 8 channels for QUAD (4 distances + 4 coordinates)
+        geometry_channels = 8 if geometry_type == 'QUAD' else 5
+        self.geometry_head = nn.Sequential(
+            nn.Conv2d(feature_dim, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, geometry_channels, 1)
+        )
+        
+        self.geometry_type = geometry_type
+        
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass
+        
+        Args:
+            x: Input images [B, 3, H, W]
+            
+        Returns:
+            score_map: Text confidence scores [B, 1, H/4, W/4]
+            geometry_map: Geometry predictions [B, 8, H/4, W/4]
+        """
+        # Extract multi-scale features
+        features = self.backbone_net(x)
+        
+        # Feature fusion
+        fused_features = self.feature_fusion(features)
+        
+        # Prediction heads
+        score_map = self.score_head(fused_features)
+        geometry_map = self.geometry_head(fused_features)
+        
+        return score_map, geometry_map
+```
+
+Phase 2: Loss Function and Training Pipeline (Week 2-3)
+
+2.1 Loss Function Implementation (losses/east_loss.py)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class EASTLoss(nn.Module):
+    """Combined loss for EAST model"""
+    
+    def __init__(self, geometry_weight: float = 1.0):
+        super().__init__()
+        self.geometry_weight = geometry_weight
+        
+    def score_loss(self, pred_score, gt_score, gt_mask):
+        """Class-balanced cross-entropy loss"""
+        # Flatten predictions and targets
+        pred_score = pred_score.view(-1)
+        gt_score = gt_score.view(-1)
+        gt_mask = gt_mask.view(-1)
+        
+        # Select valid pixels
+        valid_mask = gt_mask > 0
+        pred_score = pred_score[valid_mask]
+        gt_score = gt_score[valid_mask]
+        
+        # Class balancing
+        positive_mask = gt_score > 0.5
+        negative_mask = gt_score <= 0.5
+        
+        num_positive = positive_mask.sum().float()
+        num_negative = negative_mask.sum().float()
+        
+        if num_positive > 0 and num_negative > 0:
+            # Balance positive and negative samples
+            positive_loss = F.binary_cross_entropy(
+                pred_score[positive_mask], 
+                gt_score[positive_mask], 
+                reduction='mean'
+            )
+            negative_loss = F.binary_cross_entropy(
+                pred_score[negative_mask], 
+                gt_score[negative_mask], 
+                reduction='mean'
+            )
+            
+            loss = (positive_loss + negative_loss) / 2
+        else:
+            loss = F.binary_cross_entropy(pred_score, gt_score, reduction='mean')
+            
+        return loss
+    
+    def geometry_loss(self, pred_geo, gt_geo, gt_mask):
+        """Smooth L1 loss for geometry prediction"""
+        # Apply mask to select text regions only
+        mask = gt_mask.unsqueeze(1).expand_as(pred_geo)
+        
+        pred_geo_masked = pred_geo * mask
+        gt_geo_masked = gt_geo * mask
+        
+        loss = F.smooth_l1_loss(pred_geo_masked, gt_geo_masked, reduction='sum')
+        
+        # Normalize by number of text pixels
+        num_text_pixels = mask.sum()
+        if num_text_pixels > 0:
+            loss = loss / num_text_pixels
+        else:
+            loss = loss * 0  # No text regions
+            
+        return loss
+    
+    def forward(self, predictions, targets):
+        """
+        Args:
+            predictions: (score_map, geometry_map)
+            targets: (gt_score, gt_geometry, gt_mask)
+        """
+        pred_score, pred_geo = predictions
+        gt_score, gt_geo, gt_mask = targets
+        
+        # Calculate individual losses
+        s_loss = self.score_loss(pred_score, gt_score, gt_mask)
+        g_loss = self.geometry_loss(pred_geo, gt_geo, gt_mask)
+        
+        # Combined loss
+        total_loss = s_loss + self.geometry_weight * g_loss
+        
+        return {
+            'total_loss': total_loss,
+            'score_loss': s_loss,
+            'geometry_loss': g_loss
+        }
+```
+
+2.2 Training Configuration (configs/training_config.yaml)
+```yaml
+# Model configuration
+model:
+  backbone: "resnet18"
+  pretrained: true
+  feature_dim: 128
+  geometry_type: "QUAD"
+
+# Training hyperparameters
+training:
+  epochs: 100
+  batch_size: 8
+  learning_rate: 0.001
+  weight_decay: 0.0005
+  
+  # Optimizer settings
+  optimizer: "Adam"
+  scheduler: "StepLR"
+  step_size: 50
+  gamma: 0.1
+  
+  # Training options
+  mixed_precision: true
+  gradient_clipping: 1.0
+  accumulate_grad_batches: 1
+  
+  # Validation
+  val_check_interval: 1000
+  save_top_k: 3
+  monitor: "val_fscore"
+  mode: "max"
+
+# Loss function
+loss:
+  geometry_weight: 1.0
+
+# Data configuration
+data:
+  dataset_path: "data/icdar2015"
+  input_size: [512, 512]
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  
+  # Data loading
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  
+  # Augmentation
+  augmentation:
+    random_rotation: 10  # degrees
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.1
+    horizontal_flip: 0.5
+    
+# Logging
+logging:
+  project_name: "east-implement"
+  experiment_name: "resnet18-baseline"
+  log_every_n_steps: 50
+  save_dir: "experiments"
+```
+
+2.3 Training Script (tools/train.py)
+```python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import yaml
+import argparse
+from pathlib import Path
+import logging
+from tqdm import tqdm
+
+from east.models.east_model import EAST
+from east.losses.east_loss import EASTLoss
+from east.datasets.icdar import ICDARDataset
+from east.utils.metrics import EvaluationMetrics
+
+def setup_logging(log_dir):
+    """Setup logging configuration"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_dir / 'train.log'),
+            logging.StreamHandler()
+        ]
+    )
+
+def train_epoch(model, dataloader, criterion, optimizer, device, scaler=None):
+    """Train for one epoch"""
+    model.train()
+    total_loss = 0
+    total_score_loss = 0
+    total_geo_loss = 0
+    
+    pbar = tqdm(dataloader, desc="Training")
+    for batch_idx, (images, targets) in enumerate(pbar):
+        images = images.to(device)
+        targets = [t.to(device) for t in targets]
+        
+        optimizer.zero_grad()
+        
+        if scaler:
+            with torch.cuda.amp.autocast():
+                predictions = model(images)
+                loss_dict = criterion(predictions, targets)
+                loss = loss_dict['total_loss']
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            predictions = model(images)
+            loss_dict = criterion(predictions, targets)
+            loss = loss_dict['total_loss']
+            
+            loss.backward()
+            optimizer.step()
+        
+        # Update metrics
+        total_loss += loss.item()
+        total_score_loss += loss_dict['score_loss'].item()
+        total_geo_loss += loss_dict['geometry_loss'].item()
+        
+        pbar.set_postfix({
+            'Loss': f"{loss.item():.4f}",
+            'Score': f"{loss_dict['score_loss'].item():.4f}",
+            'Geo': f"{loss_dict['geometry_loss'].item():.4f}"
+        })
+    
+    return {
+        'train_loss': total_loss / len(dataloader),
+        'train_score_loss': total_score_loss / len(dataloader),
+        'train_geo_loss': total_geo_loss / len(dataloader)
+    }
+
+def main():
+    parser = argparse.ArgumentParser(description='Train EAST model')
+    parser.add_argument('--config', type=str, required=True, help='Config file path')
+    parser.add_argument('--resume', type=str, help='Resume from checkpoint')
+    args = parser.parse_args()
+    
+    # Load configuration
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Setup device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Setup logging
+    experiment_dir = Path(config['logging']['save_dir']) / config['logging']['experiment_name']
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+    setup_logging(experiment_dir)
+    
+    # Initialize model
+    model = EAST(**config['model']).to(device)
+    
+    # Initialize loss and optimizer
+    criterion = EASTLoss(**config['loss'])
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=config['training']['learning_rate'],
+        weight_decay=config['training']['weight_decay']
+    )
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=config['training']['step_size'],
+        gamma=config['training']['gamma']
+    )
+    
+    # Mixed precision training
+    scaler = torch.cuda.amp.GradScaler() if config['training']['mixed_precision'] else None
+    
+    # Initialize datasets
+    train_dataset = ICDARDataset(
+        config['data']['dataset_path'],
+        split='train',
+        input_size=config['data']['input_size'],
+        augmentation=config['data']['augmentation']
+    )
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=True,
+        num_workers=config['data']['num_workers'],
+        pin_memory=config['data']['pin_memory'],
+        prefetch_factor=config['data']['prefetch_factor']
+    )
+    
+    # Training loop
+    best_fscore = 0
+    for epoch in range(config['training']['epochs']):
+        logging.info(f"Epoch {epoch + 1}/{config['training']['epochs']}")
+        
+        # Train
+        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, scaler)
+        
+        # Log metrics
+        logging.info(f"Train Loss: {train_metrics['train_loss']:.4f}")
+        
+        # Update learning rate
+        scheduler.step()
+        
+        # Save checkpoint
+        checkpoint_path = experiment_dir / f"epoch_{epoch:03d}.pth"
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'train_metrics': train_metrics,
+            'config': config
+        }, checkpoint_path)
+
+if __name__ == '__main__':
+    main()
+```
+
+Phase 3: Dataset and Preprocessing (Week 3-4)
+
+3.1 ICDAR Dataset Implementation (datasets/icdar.py)
+```python
+import torch
+from torch.utils.data import Dataset
+import cv2
+import numpy as np
+from pathlib import Path
+import json
+from typing import Tuple, List, Dict
+
+class ICDARDataset(Dataset):
+    """ICDAR dataset for scene text detection"""
+    
+    def __init__(self, 
+                 data_path: str,
+                 split: str = 'train',
+                 input_size: Tuple[int, int] = (512, 512),
+                 augmentation: Dict = None):
+        self.data_path = Path(data_path)
+        self.split = split
+        self.input_size = input_size
+        self.augmentation = augmentation or {}
+        
+        # Load image list
+        split_file = self.data_path / 'splits' / f'{split}.txt'
+        with open(split_file, 'r') as f:
+            self.image_names = [line.strip() for line in f.readlines()]
+        
+        # Setup transforms
+        from .transforms import get_transforms
+        self.transform = get_transforms(input_size, augmentation if split == 'train' else {})
+    
+    def __len__(self):
+        return len(self.image_names)
+    
+    def __getitem__(self, idx):
+        image_name = self.image_names[idx]
+        
+        # Load image
+        image_path = self.data_path / self.split / 'images' / f'{image_name}.jpg'
+        image = cv2.imread(str(image_path))
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Load annotation
+        annotation_path = self.data_path / self.split / 'annotations' / f'{image_name}.txt'
+        annotations = self._load_annotation(annotation_path)
+        
+        # Apply transforms
+        sample = {
+            'image': image,
+            'annotations': annotations
+        }
+        sample = self.transform(sample)
+        
+        # Generate ground truth maps
+        score_map, geometry_map, mask = self._generate_ground_truth(
+            sample['annotations'], 
+            self.input_size
+        )
+        
+        return sample['image'], (score_map, geometry_map, mask)
+    
+    def _load_annotation(self, annotation_path: Path) -> List[Dict]:
+        """Load ICDAR format annotations"""
+        annotations = []
+        
+        with open(annotation_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                parts = line.strip().split(',', 8)
+                if len(parts) >= 8:
+                    quad = [int(x) for x in parts[:8]]
+                    text = parts[8] if len(parts) > 8 else ""
+                    
+                    # Skip difficult samples marked with ###
+                    if text == "###":
+                        continue
+                    
+                    annotations.append({
+                        'quad': quad,
+                        'text': text
+                    })
+        
+        return annotations
+    
+    def _generate_ground_truth(self, annotations, input_size):
+        """Generate score map, geometry map, and mask"""
+        h, w = input_size
+        stride = 4  # Feature map stride
+        feature_h, feature_w = h // stride, w // stride
+        
+        # Initialize maps
+        score_map = np.zeros((feature_h, feature_w), dtype=np.float32)
+        geometry_map = np.zeros((8, feature_h, feature_w), dtype=np.float32)
+        mask = np.zeros((feature_h, feature_w), dtype=np.float32)
+        
+        for annotation in annotations:
+            quad = np.array(annotation['quad']).reshape(4, 2)
+            
+            # Scale coordinates to feature map size
+            quad_scaled = quad / stride
+            
+            # Generate score map using polygon fill
+            cv2.fillPoly(score_map, [quad_scaled.astype(np.int32)], 1)
+            
+            # Generate geometry map (distances to quad vertices)
+            self._generate_geometry_map(quad_scaled, geometry_map, mask, feature_h, feature_w)
+        
+        # Convert to tensors
+        score_map = torch.from_numpy(score_map).unsqueeze(0)  # [1, H, W]
+        geometry_map = torch.from_numpy(geometry_map)         # [8, H, W]
+        mask = torch.from_numpy(mask).unsqueeze(0)            # [1, H, W]
+        
+        return score_map, geometry_map, mask
+    
+    def _generate_geometry_map(self, quad, geometry_map, mask, h, w):
+        """Generate geometry map for a single text instance"""
+        # Create pixel grid
+        y_coords, x_coords = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
+        pixel_coords = np.stack([x_coords, y_coords], axis=-1)
+        
+        # Check which pixels are inside the quadrilateral
+        inside_mask = self._point_in_quad(pixel_coords, quad)
+        
+        # For pixels inside, calculate distances to quad edges
+        for y in range(h):
+            for x in range(w):
+                if inside_mask[y, x]:
+                    distances = self._calculate_distances(np.array([x, y]), quad)
+                    geometry_map[:4, y, x] = distances
+                    geometry_map[4:, y, x] = quad.flatten()  # Store quad coordinates
+                    mask[y, x] = 1
+    
+    def _point_in_quad(self, points, quad):
+        """Check if points are inside quadrilateral using cross product"""
+        def cross_product_2d(a, b):
+            return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+        
+        # Vectorized point-in-polygon test
+        h, w = points.shape[:2]
+        inside = np.ones((h, w), dtype=bool)
+        
+        for i in range(4):
+            edge_start = quad[i]
+            edge_end = quad[(i + 1) % 4]
+            edge_vector = edge_end - edge_start
+            point_vector = points - edge_start
+            
+            cross = cross_product_2d(edge_vector, point_vector)
+            inside &= (cross >= 0)
+        
+        return inside
+    
+    def _calculate_distances(self, point, quad):
+        """Calculate distances from point to quad edges"""
+        distances = []
+        for i in range(4):
+            edge_start = quad[i]
+            edge_end = quad[(i + 1) % 4]
+            
+            # Distance from point to line segment
+            dist = self._point_to_line_distance(point, edge_start, edge_end)
+            distances.append(dist)
+        
+        return np.array(distances, dtype=np.float32)
+    
+    def _point_to_line_distance(self, point, line_start, line_end):
+        """Calculate perpendicular distance from point to line segment"""
+        line_vec = line_end - line_start
+        point_vec = point - line_start
+        
+        line_len = np.linalg.norm(line_vec)
+        if line_len == 0:
+            return np.linalg.norm(point_vec)
+        
+        line_unitvec = line_vec / line_len
+        proj_length = np.dot(point_vec, line_unitvec)
+        
+        if proj_length < 0:
+            return np.linalg.norm(point_vec)
+        elif proj_length > line_len:
+            return np.linalg.norm(point - line_end)
+        else:
+            proj_point = line_start + proj_length * line_unitvec
+            return np.linalg.norm(point - proj_point)
+```
+
+Phase 4: Evaluation and Deployment (Week 4-5)
+
+4.1 Post-processing and Evaluation (utils/postprocess.py)
+```python
+import torch
+import numpy as np
+import cv2
+from typing import List, Tuple
+
+def restore_quadrangles(score_map: torch.Tensor, 
+                       geometry_map: torch.Tensor,
+                       score_thresh: float = 0.8,
+                       nms_thresh: float = 0.2) -> List[np.ndarray]:
+    """
+    Restore quadrangles from model predictions
+    
+    Args:
+        score_map: [1, H, W] text confidence scores
+        geometry_map: [8, H, W] geometry predictions
+        score_thresh: Confidence threshold for detection
+        nms_thresh: NMS IoU threshold
+    
+    Returns:
+        List of quadrangles in format [[x1,y1,x2,y2,x3,y3,x4,y4], ...]
+    """
+    score_map = score_map.squeeze(0).cpu().numpy()
+    geometry_map = geometry_map.cpu().numpy()
+    
+    # Find text pixels above threshold
+    text_mask = score_map > score_thresh
+    text_coords = np.where(text_mask)
+    
+    if len(text_coords[0]) == 0:
+        return []
+    
+    # Extract detections
+    detections = []
+    for y, x in zip(text_coords[0], text_coords[1]):
+        score = score_map[y, x]
+        
+        # Extract geometry at this pixel
+        distances = geometry_map[:4, y, x]  # Distances to edges
+        quad_coords = geometry_map[4:, y, x]  # Quad coordinates
+        
+        # Reconstruct quadrangle
+        quad = quad_coords.reshape(4, 2) * 4  # Scale back from feature map
+        
+        detections.append({
+            'quad': quad,
+            'score': score
+        })
+    
+    # Apply NMS
+    if len(detections) > 0:
+        detections = apply_nms(detections, nms_thresh)
+    
+    # Convert to required format
+    quadrangles = []
+    for det in detections:
+        quad = det['quad'].flatten().astype(np.int32)
+        quadrangles.append(quad)
+    
+    return quadrangles
+
+def apply_nms(detections: List[dict], threshold: float) -> List[dict]:
+    """Apply Non-Maximum Suppression to detections"""
+    if len(detections) == 0:
+        return []
+    
+    # Sort by confidence score
+    detections.sort(key=lambda x: x['score'], reverse=True)
+    
+    keep = []
+    while detections:
+        # Keep highest scoring detection
+        current = detections.pop(0)
+        keep.append(current)
+        
+        # Remove overlapping detections
+        remaining = []
+        for det in detections:
+            iou = calculate_quad_iou(current['quad'], det['quad'])
+            if iou < threshold:
+                remaining.append(det)
+        
+        detections = remaining
+    
+    return keep
+
+def calculate_quad_iou(quad1: np.ndarray, quad2: np.ndarray) -> float:
+    """Calculate IoU between two quadrilaterals"""
+    # Convert to integer coordinates
+    quad1 = quad1.astype(np.int32)
+    quad2 = quad2.astype(np.int32)
+    
+    # Create masks
+    mask1 = np.zeros((1000, 1000), dtype=np.uint8)
+    mask2 = np.zeros((1000, 1000), dtype=np.uint8)
+    
+    cv2.fillPoly(mask1, [quad1], 1)
+    cv2.fillPoly(mask2, [quad2], 1)
+    
+    # Calculate intersection and union
+    intersection = np.logical_and(mask1, mask2).sum()
+    union = np.logical_or(mask1, mask2).sum()
+    
+    if union == 0:
+        return 0.0
+    
+    return intersection / union
+```
+
+4.2 ICDAR Evaluation Integration (evaluation/icdar_eval.py)
+```python
+import subprocess
+import tempfile
+from pathlib import Path
+import numpy as np
+from typing import Dict, List
+
+class ICDAREvaluator:
+    """ICDAR evaluation wrapper"""
+    
+    def __init__(self, gt_path: str, eval_script_path: str = None):
+        self.gt_path = Path(gt_path)
+        self.eval_script_path = eval_script_path
+        
+    def evaluate(self, predictions: Dict[str, List[np.ndarray]]) -> Dict[str, float]:
+        """
+        Evaluate predictions using ICDAR protocol
+        
+        Args:
+            predictions: Dict mapping image_name -> list of quadrangles
+            
+        Returns:
+            Dictionary with precision, recall, f_score
+        """
+        # Create temporary directory for prediction files
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pred_dir = Path(temp_dir) / 'predictions'
+            pred_dir.mkdir()
+            
+            # Write prediction files
+            for image_name, quads in predictions.items():
+                pred_file = pred_dir / f'res_{image_name}.txt'
+                self._write_prediction_file(pred_file, quads)
+            
+            # Run evaluation
+            if self.eval_script_path:
+                # Use official evaluation script
+                metrics = self._run_official_evaluation(pred_dir)
+            else:
+                # Use built-in evaluation
+                metrics = self._evaluate_builtin(predictions)
+        
+        return metrics
+    
+    def _write_prediction_file(self, file_path: Path, quadrangles: List[np.ndarray]):
+        """Write predictions in ICDAR format"""
+        with open(file_path, 'w') as f:
+            for quad in quadrangles:
+                # Format: x1,y1,x2,y2,x3,y3,x4,y4
+                coords = ','.join(map(str, quad))
+                f.write(f'{coords}\n')
+    
+    def _run_official_evaluation(self, pred_dir: Path) -> Dict[str, float]:
+        """Run official ICDAR evaluation script"""
+        try:
+            result = subprocess.run([
+                'python', self.eval_script_path,
+                '-g', str(self.gt_path),
+                '-s', str(pred_dir)
+            ], capture_output=True, text=True, check=True)
+            
+            # Parse results
+            output = result.stdout
+            precision = self._extract_metric(output, 'Precision')
+            recall = self._extract_metric(output, 'Recall')
+            f_score = self._extract_metric(output, 'F-score')
+            
+            return {
+                'precision': precision,
+                'recall': recall,
+                'f_score': f_score
+            }
+            
+        except subprocess.CalledProcessError as e:
+            print(f"Evaluation script failed: {e}")
+            return self._evaluate_builtin(pred_dir)
+    
+    def _evaluate_builtin(self, predictions: Dict[str, List[np.ndarray]]) -> Dict[str, float]:
+        """Built-in evaluation implementation"""
+        total_tp = 0
+        total_fp = 0
+        total_fn = 0
+        
+        for image_name, pred_quads in predictions.items():
+            gt_file = self.gt_path / f'gt_{image_name}.txt'
+            gt_quads = self._load_ground_truth(gt_file)
+            
+            tp, fp, fn = self._calculate_detection_metrics(pred_quads, gt_quads)
+            total_tp += tp
+            total_fp += fp
+            total_fn += fn
+        
+        # Calculate metrics
+        precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+        recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+        f_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        
+        return {
+            'precision': precision,
+            'recall': recall,
+            'f_score': f_score
+        }
+    
+    def _load_ground_truth(self, gt_file: Path) -> List[np.ndarray]:
+        """Load ground truth quadrangles"""
+        quadrangles = []
+        
+        if gt_file.exists():
+            with open(gt_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split(',')
+                    if len(parts) >= 8:
+                        coords = [int(x) for x in parts[:8]]
+                        quadrangles.append(np.array(coords))
+        
+        return quadrangles
+    
+    def _calculate_detection_metrics(self, pred_quads, gt_quads, iou_thresh=0.5):
+        """Calculate TP, FP, FN for detection"""
+        if len(gt_quads) == 0:
+            return 0, len(pred_quads), 0
+        
+        if len(pred_quads) == 0:
+            return 0, 0, len(gt_quads)
+        
+        # Calculate IoU matrix
+        iou_matrix = np.zeros((len(pred_quads), len(gt_quads)))
+        for i, pred_quad in enumerate(pred_quads):
+            for j, gt_quad in enumerate(gt_quads):
+                iou_matrix[i, j] = self._calculate_quad_iou(pred_quad, gt_quad)
+        
+        # Find matches
+        matched_gt = set()
+        tp = 0
+        
+        for i in range(len(pred_quads)):
+            max_iou_idx = np.argmax(iou_matrix[i])
+            max_iou = iou_matrix[i, max_iou_idx]
+            
+            if max_iou >= iou_thresh and max_iou_idx not in matched_gt:
+                tp += 1
+                matched_gt.add(max_iou_idx)
+        
+        fp = len(pred_quads) - tp
+        fn = len(gt_quads) - tp
+        
+        return tp, fp, fn
+```
+
+4.3 Docker Configuration (docker/Dockerfile.train)
+```dockerfile
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
+
+# Set working directory
+WORKDIR /workspace
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    libglib2.0-0 \
+    libgtk2.0-dev \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code
+COPY . .
+
+# Install package in development mode
+RUN pip install -e .
+
+# Set environment variables
+ENV PYTHONPATH=/workspace:$PYTHONPATH
+ENV CUDA_VISIBLE_DEVICES=0
+
+# Default command
+CMD ["python", "tools/train.py", "--config", "configs/east_resnet18.yaml"]
+```
+
+4.4 Production Deployment (docker/Dockerfile.serve)
+```dockerfile
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements-serve.txt .
+RUN pip install --no-cache-dir -r requirements-serve.txt
+
+# Copy model and serving code
+COPY models/ ./models/
+COPY serve/ ./serve/
+COPY checkpoints/ ./checkpoints/
+
+# Expose port
+EXPOSE 8000
+
+# Run FastAPI server
+CMD ["uvicorn", "serve.api:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+Implementation Timeline and Milestones
+
+Week 1: Core Architecture
+- ✅ Project structure setup
+- ✅ ResNet backbone implementation
+- ✅ Feature fusion network
+- ✅ EAST model class
+
+Week 2: Training Infrastructure  
+- ✅ Loss function implementation
+- ✅ Training script with mixed precision
+- ✅ Configuration system
+- ✅ Logging and checkpointing
+
+Week 3: Data Pipeline
+- ✅ ICDAR dataset loader
+- ✅ Data augmentation pipeline
+- ✅ Ground truth map generation
+- ✅ Validation framework
+
+Week 4: Evaluation System
+- ✅ Post-processing pipeline
+- ✅ ICDAR evaluation integration
+- ✅ Visualization tools
+- ✅ Metrics calculation
+
+Week 5: Deployment & Documentation
+- ✅ Docker containerization
+- ✅ ONNX export functionality
+- ✅ API serving infrastructure
+- ✅ Educational notebooks
+
+Performance Targets and Validation
+
+Training Performance:
+- Convergence: <100 epochs on ICDAR 2015
+- Memory Usage: <8GB VRAM with batch size 8
+- Training Speed: >100 images/sec on RTX 4090
+
+Model Performance:
+- ICDAR 2015 F-score: >77% (target >80%)
+- Inference Speed: <50ms per image
+- Model Size: <100MB for deployment
+
+Code Quality:
+- Test Coverage: >85%
+- Documentation: >90% API coverage
+- CI/CD: All tests passing
+- Reproducibility: Bit-exact across platforms
+
+This implementation plan provides a comprehensive roadmap for building a production-ready EAST implementation that meets both research standards and practical deployment requirements. The modular architecture supports extensibility while maintaining performance and reproducibility standards outlined in the project constitution.

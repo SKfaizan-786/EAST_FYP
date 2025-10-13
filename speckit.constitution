@@ -1,0 +1,96 @@
+EAST-Implement Constitution
+
+Preamble
+
+EAST-Implement is a research and engineering project focused on efficient, accurate scene text detection and recognition. This constitution codifies the project's values, engineering standards, and operational practices to ensure reproducible, high-quality, and educational open-source work that meets community benchmarks.
+
+Core Principles
+
+1. Reproducible Research
+
+- Every experiment must include a reproducible recipe: exact code commit (Git SHA), environment specification (OS, Python, CUDA, library versions), dataset versions and splits, hyperparameters, and random seeds.
+- Results should be accompanied by scripts to reproduce training, evaluation, and inference (including pre/post-processing). Use lightweight containers or environment files (conda/venv, pip freeze, or Docker) when appropriate.
+- Artifacts (trained checkpoints, logs, evaluation outputs, and key plots) must be archived with stable URLs (GitHub Releases, Zenodo, or institutional storage) and linked from the experiment README.
+
+2. Open-source Development & PyTorch Best Practices
+
+- Code must be permissively licensed (default MIT/Apache) and include contributor guidelines and a code of conduct.
+- Follow PyTorch idioms: use torch.nn.Module for models, torch.utils.data.Dataset and DataLoader for datasets, and proper device-agnostic code (use map_location for checkpoints).
+- Separate model, training, evaluation, and data-loading code into clear modules. Avoid monolithic scripts.
+- Prefer functional, testable components; include unit tests for critical utilities and sanity checks for model outputs.
+- Use deterministic operations where feasible (torch.backends.cudnn.deterministic, seeding helper utility) and document non-deterministic choices.
+
+3. Performance-first Approach
+
+- Define quantifiable metrics per task (e.g., precision/recall/F1 for detection, IoU thresholds, mAP, FPS for speed, memory footprint).
+- Track wall-clock time, GPU memory (peak and average), and per-epoch throughput (images/sec). Provide profiling artifacts for major releases.
+- Introduce benchmarking scripts that run standardized evaluation across supported backbones and configurations.
+- Any architectural or algorithmic change should include a performance vs. cost analysis: metric delta, runtime delta, and resource delta.
+
+4. Educational Focus
+
+- Provide clear tutorials: quickstart (run inference on an example), training guide (train on a small dataset), and deep-dive (explain architecture and losses).
+- Annotate code with explanatory docstrings and linkable references to papers or blog posts.
+- Publish a set of notebooks and small datasets for newcomers to reproduce experiments on CPU and single-GPU setups.
+- Maintain a glossary of terms and a short FAQ covering common pitfalls (e.g., mixed precision, multi-GPU synchronization).
+
+5. Modular Architecture
+
+- Support pluggable backbone modules (ResNet, MobileNetV3, EfficientNet, custom), necks, and heads via a config system (YAML/JSON) and factory methods.
+- Configs should declare model, optimizer, scheduler, dataset, transforms, and runtime settings. Keep defaults sensible and well-documented.
+- Maintain backward-compatible lightweight adapter code for user-contributed backbones.
+
+6. ICDAR Competition Standards Compliance
+
+- Support the standard ICDAR dataset formats, evaluation scripts, and submission formats for the competitions relevant to scene text detection/recognition.
+- Ensure dataset splitting, augmentations, and evaluation thresholds follow ICDAR guidelines and cite the specific dataset versions used.
+- Include a validation harness that mirrors ICDAR evaluation (IoU matching rules, ignore regions, evaluation thresholds), and cross-check outputs with official scripts when possible.
+
+7. GPU-Optimized Training
+
+- Provide optional mixed-precision training with AMP (torch.cuda.amp) and a consistent interface to enable/disable it.
+- Use memory-efficient layers and techniques (gradient checkpointing, fused ops, grouped convolutions) where they demonstrably help.
+- Default training workflows must support multi-GPU distributed training (torch.distributed) with clear launchers and reproducible seeds across ranks.
+- Include scripts to profile memory and runtime and document expected resource usage for each sample config.
+
+Operational Rules
+
+- Pull requests must include a short description of the change, a reproducibility checklist, and any benchmark numbers. Changes that affect performance must include benchmark comparisons.
+- Maintain a CHANGELOG.md with semantic version tags. Significant reproducibility-impacting changes should increment major/minor versions accordingly.
+- Encourage issue templates that collect environment and reproduction logs.
+
+Appendices
+
+A. Minimal Reproducibility Checklist
+
+- Git commit: <SHA>
+- Environment: OS, Python, CUDA, cuDNN, PyTorch, and package versions
+- Dataset: name, version, split files/URLs
+- Config: config file path and any overrides
+- Seeds: RNG seeds used for PyTorch, NumPy, and Python
+- Commands: exact commands used for train/eval/infer
+- Artifacts: links to checkpoints and logs
+
+B. ICDAR Compatibility Checklist
+
+- Dataset reader supports official ICDAR formats
+- Evaluation uses official or exact-equivalent scripts
+- Submission files match ICDAR expected formats (file naming, csv/tsv layout)
+- Documented pre/post-processing steps and thresholding choices
+
+C. Suggested CI and Badges
+
+- Reproducible: ``reproducible`` badge linked to a sample run log
+- Tests: unit tests and smoke tests on CPU/GPU where available
+- Lint: code style checks (flake8/ruff, black)
+
+D. Quick verification commands (example)
+
+# Create conda env and install
+conda env create -f environment.yml; conda activate east-implement
+# Reproduce a published result (example)
+python tools/train.py --config configs/east_r50.yaml --seed 42 --logdir reproductions/run1
+
+Completion
+
+This constitution is a living document. Contributors should propose changes via PRs and demonstrate how updates preserve or improve reproducibility, performance, and educational value.
