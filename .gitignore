@@ -33,7 +33,6 @@ MANIFEST
 
 # Data and Datasets
 data/
-datasets/
 *.zip
 *.tar.gz
 *.rar
@@ -65,6 +64,9 @@ venv.bak/
 *.swp
 *.swo
 *~
+
+.github/
+.specify
 
 # OS
 .DS_Store
