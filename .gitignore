@@ -1,0 +1,40 @@
+# FYP Environment
+fyp_ens/
+
+# Data and Models (too large for git)
+data/
+models/
+outputs/
+
+# Keep sample results for demonstration
+!sample_results/
+
+# ICDAR Evaluation Files (contains ground truth)
+icdar_eval/
+
+# Temporary optimization files
+best_choquet_params.txt
+grid_search_results.txt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
